@@ -175,3 +175,43 @@ while x.size(1) < max_length:
     xcol = torch.gather(topk_indices, -1, ix)
     x = torch.cat((x, xcol), dim=1) 
 
+class DataLoader:
+    def __init__(self, B, T):
+        self.B = B
+        self. T
+
+        with open('input_txt', 'r') as f:
+            text = f.read()
+        
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens(self.current_position : self.current_position+B*T+1)
+        x = buf[:-1].view(B,T)
+        y = buf[1:].view(B,T)
+        self.current_position += B*T
+        if self.current_position + (B*T + 1)> len(self.tokens):
+            self.current_position = 0
+        return x,y 
+
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    print(f'step {i}: loss {loss.item()}')
+
+    
