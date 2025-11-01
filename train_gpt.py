@@ -4,12 +4,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
+import time
 
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     n_layers: int = 12
     n_heads: int = 12
     n_embd: int = 768
@@ -57,11 +58,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2) # (B, n_head, T, head_dim)
         q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2) # (B, n_head, T, head_dim)
         v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2) # (B, n_head, T, head_dim)
-        att = (q @ k).transpose(1, 2) # (B, n_head, T, T)
+        # k_transpose = k.transpose(-2,-1) # (B, n_head, head_dim, T)
+        # att = (q @ k_transpose) # (B, n_head, T, T)
 
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
@@ -80,7 +83,17 @@ class GPT(nn.Module):
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-    
+        self.transformer.wte.weight = self.lm_head.weight
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = 0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets = None):
         B, T = idx.size()
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
@@ -113,8 +126,8 @@ class GPT(nn.Module):
             'gpt2-large':   dict(n_layers=36, n_heads=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layers=48, n_heads=25, n_embd=1600), # 1558M params
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        print("forcing vocab_size=50304, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50304 # always 50304 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
@@ -165,22 +178,12 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 
 
-
-while x.size(1) < max_length:
-    logits = model(x) # (B, T, V)
-    logits = logits[:, -1, :] # final layer of logits; (B, V)
-    probs = F.softmax(logits, dim=-1) # softmax over vocabulary
-    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-    ix = torch.multinomial(topk_probs, 1) # (B, 1)
-    xcol = torch.gather(topk_indices, -1, ix)
-    x = torch.cat((x, xcol), dim=1) 
-
 class DataLoader:
     def __init__(self, B, T):
         self.B = B
-        self. T
+        self.T = T
 
-        with open('input_txt', 'r') as f:
+        with open('tiny_shakespeare.txt', 'r') as f:
             text = f.read()
         
         enc = tiktoken.get_encoding('gpt2')
@@ -191,7 +194,7 @@ class DataLoader:
     
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens(self.current_position : self.current_position+B*T+1)
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = buf[:-1].view(B,T)
         y = buf[1:].view(B,T)
         self.current_position += B*T
@@ -203,15 +206,24 @@ device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoader(B=16, T=1024)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
-for i in range(50):
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas = (0.9, 0.95), eps = 1.0e-8)
+# torch.set_float32_matmul_precision('high')
+model = torch.compile(model)
+_time = time.time()
+for i in range(1000):
+    t0 = time.time()
+    output, labels = train_loader.next_batch()
+    output, labels = output.to(device), labels.to(device)
+    with torch.autocast(device_type=device, dtype = torch.bfloat16):
+        logits, loss = model(output, labels)
     optimizer.zero_grad()
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    print(f'step {i}: loss {loss.item()}')
+    t1 = time.time()
+    tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0)
 
-    
+    print(f" time is {(t1 - t0)*1000} ms for {tokens_per_sec} tok/sec")
